@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "ble/ble_proximity.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -507,10 +508,14 @@ void Application::InitializeProtocol() {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
         }
+        // Start BLE proximity detection after WebSocket connection is established
+        StartBleProximity();
     });
-    
+
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        // Stop BLE proximity when audio channel closes
+        StopBleProximity();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -601,6 +606,18 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "event") == 0) {
+            // Server-to-device event messages (e.g., proximity_matched for LED/sound feedback)
+            auto event = cJSON_GetObjectItem(root, "event");
+            if (cJSON_IsString(event)) {
+                ESP_LOGI(TAG, "Received event: %s", event->valuestring);
+                if (strcmp(event->valuestring, "proximity_matched") == 0) {
+                    // Optional: LED/sound feedback when proximity match is confirmed
+                    Schedule([this]() {
+                        PlaySound(Lang::Sounds::OGG_SUCCESS);
+                    });
+                }
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -1127,5 +1144,84 @@ void Application::ResetProtocol() {
         // Reset protocol
         protocol_.reset();
     });
+}
+
+void Application::StartBleProximity() {
+    if (ble_proximity_running_) return;
+
+    auto& ble = BleProximity::GetInstance();
+
+    // Configure BLE proximity
+    BleProximity::Config config;
+    config.device_type = 0x01;  // Ti-social device type
+    // Use MAC address as device UUID (32 hex chars from 6-byte MAC, zero-padded)
+    std::string mac = SystemInfo::GetMacAddress();
+    // Remove colons and pad to 32 chars: "AABBCCDDEEFF" → "AABBCCDDEEFF00000000000000000000"
+    std::string mac_hex;
+    for (char c : mac) {
+        if (c != ':' && c != '-') {
+            mac_hex += c;
+        }
+    }
+    while (mac_hex.length() < 32) {
+        mac_hex += '0';
+    }
+    config.device_uuid = mac_hex.substr(0, 32);
+    config.enter_rssi_threshold = -70;
+    config.leave_rssi_threshold = -85;
+    config.enter_duration_ms = 2000;
+    config.leave_duration_ms = 5000;
+    config.company_id = 0xFFFF;  // Default company ID
+
+    // Register callback to report proximity events to server
+    ble.RegisterProximityCallback([this](const BleProximity::ProximityEvent& event) {
+        if (!protocol_ || !protocol_->IsAudioChannelOpened()) return;
+
+        // Build JSON payload
+        int64_t timestamp_ms = esp_timer_get_time() / 1000;
+        std::string action = event.is_enter ? "enter" : "leave";
+
+        // Construct payload JSON manually
+        std::string payload = "{";
+        payload += "\"action\":\"" + action + "\",";
+        payload += "\"detected_device_id\":\"" + event.device_id + "\",";
+        payload += "\"detected_device_type\":\"xiaozhi_esp32s3\",";
+        payload += "\"rssi\":" + std::to_string(event.rssi) + ",";
+
+        char dist_buf[16];
+        snprintf(dist_buf, sizeof(dist_buf), "%.1f", event.distance);
+        payload += std::string("\"distance\":") + dist_buf + ",";
+
+        payload += "\"timestamp\":" + std::to_string(timestamp_ms);
+        payload += "}";
+
+        ESP_LOGI(TAG, "BLE proximity %s: device=%.8s... rssi=%d dist=%.1fm",
+                 action.c_str(), event.device_id.c_str(), event.rssi, event.distance);
+
+        // Send via WebSocket
+        Schedule([this, payload = std::move(payload)]() {
+            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                protocol_->SendEvent("device_proximity", payload);
+            }
+        });
+    });
+
+    // Start BLE
+    esp_err_t ret = ble.Start(config);
+    if (ret == ESP_OK) {
+        ble_proximity_running_ = true;
+        ESP_LOGI(TAG, "BLE proximity detection started");
+    } else {
+        ESP_LOGW(TAG, "BLE proximity detection failed to start: %s", esp_err_to_name(ret));
+    }
+}
+
+void Application::StopBleProximity() {
+    if (!ble_proximity_running_) return;
+
+    auto& ble = BleProximity::GetInstance();
+    ble.Stop();
+    ble_proximity_running_ = false;
+    ESP_LOGI(TAG, "BLE proximity detection stopped");
 }
 

@@ -114,6 +114,18 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+    /**
+     * @brief Initialize BLE proximity detection
+     * Called after network is connected. Starts BLE advertising and scanning.
+     */
+    void StartBleProximity();
+
+    /**
+     * @brief Stop BLE proximity detection
+     * Called when entering states where BLE should be paused.
+     */
+    void StopBleProximity();
     
     /**
      * Reset protocol resources (thread-safe)
@@ -139,6 +151,9 @@ private:
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
+
+    bool ble_proximity_enabled_ = false;
+    bool ble_proximity_running_ = false;
 
     bool has_server_time_ = false;
     bool aborted_ = false;
